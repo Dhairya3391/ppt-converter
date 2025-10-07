@@ -35,6 +35,16 @@ import time
 import logging
 from typing import Optional
 import concurrent.futures
+import threading
+from random import uniform
+
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not available - user must set environment variables manually
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -52,8 +62,7 @@ CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 
 # OAuth scopes (broad). For tighter scope you could switch drive -> drive.file
 SCOPES = [
-    "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/documents",
+    "https://www.googleapis.com/auth/drive.file",
 ]
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -61,7 +70,9 @@ INPUT_DIR = os.path.join(BASE_DIR, "input")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 TOKEN_PATH = os.path.join(BASE_DIR, "token.json")
 # Max parallel conversions (bounded to avoid too many simultaneous HTTP requests)
-MAX_WORKERS = min(8, (os.cpu_count() or 4))
+MAX_WORKERS = min(4, (os.cpu_count() or 4))
+# Thread-local storage for per-thread Drive service
+_thread_local = None  # will initialize lazily after importing threading
 
 SUPPORTED_MIME = {
     ".doc": ("application/msword", "application/vnd.google-apps.document"),
@@ -150,7 +161,7 @@ def load_or_authorize() -> Credentials:
             authorization_prompt_message="Opening browser for authorization...",
             success_message="Authorization complete. You may close this tab.",
             access_type="offline",
-            prompt="consent",
+            # prompt removed to avoid forced re-consent
         )
         logging.info("Authorization succeeded.")
         save_credentials(creds)
@@ -184,49 +195,138 @@ def build_drive(creds: Credentials):
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def convert_one(drive, path: str):
+def convert_one(creds, path: str):
+    """
+    Convert a single file with retries.
+    Returns: 'success' | 'failed' | 'skipped'
+    """
+    global _thread_local
+    if _thread_local is None:
+        _thread_local = threading.local()
+
     ext = os.path.splitext(path)[1].lower()
     mapping = SUPPORTED_MIME.get(ext)
     if not mapping:
         logging.debug("Skipping unsupported file: %s", path)
-        return
-    src_mime, tgt_mime = mapping
+        return "skipped"
+
     filename = os.path.basename(path)
     pdf_name = os.path.splitext(filename)[0] + ".pdf"
     out_path = os.path.join(OUTPUT_DIR, pdf_name)
 
-    start = time.time()
-    file_id = None
-    try:
-        media = MediaFileUpload(path, mimetype=src_mime, resumable=False)
-        metadata = {"name": filename, "mimeType": tgt_mime}
-        created = (
-            drive.files().create(body=metadata, media_body=media, fields="id").execute()
-        )
-        file_id = created["id"]
-        logging.info("Uploaded %s (id=%s)", filename, file_id)
+    # Skip if existing PDF is newer or same mtime
+    if os.path.exists(out_path):
+        try:
+            if os.path.getmtime(out_path) >= os.path.getmtime(path):
+                logging.info("Skipping (up-to-date): %s", filename)
+                return "skipped"
+        except OSError:
+            pass
 
-        request = drive.files().export_media(fileId=file_id, mimeType="application/pdf")
-        with open(out_path, "wb") as f:
-            f.write(request.execute())
+    def thread_drive():
+        if not hasattr(_thread_local, "drive"):
+            _thread_local.drive = build_drive(creds)
+        return _thread_local.drive
 
-        elapsed = time.time() - start
-        logging.info("Saved PDF: %s (%.2fs)", out_path, elapsed)
-    except HttpError as he:
-        logging.error("Google API error on %s: %s", filename, he)
-    except Exception as e:
-        logging.error("Unexpected error on %s: %s", filename, e, exc_info=True)
-    finally:
-        if file_id:
+    size = os.path.getsize(path)
+    resumable = size > 5 * 1024 * 1024  # Use resumable uploads for files >5MB
+
+    attempts = 3
+    backoff = 1.0
+    for attempt in range(1, attempts + 1):
+        start = time.time()
+        file_id = None
+        try:
+            src_mime, tgt_mime = mapping
+            media = MediaFileUpload(path, mimetype=src_mime, resumable=resumable)
+            metadata = {"name": filename, "mimeType": tgt_mime}
+            drive = thread_drive()
+            created = (
+                drive.files()
+                .create(body=metadata, media_body=media, fields="id")
+                .execute()
+            )
+            file_id = created["id"]
+            logging.info(
+                "Uploaded %s (id=%s)%s",
+                filename,
+                file_id,
+                " [resumable]" if resumable else "",
+            )
+
+            request = drive.files().export_media(
+                fileId=file_id, mimeType="application/pdf"
+            )
+            with open(out_path, "wb") as f:
+                f.write(request.execute())
+
+            elapsed = time.time() - start
+            logging.info("Saved PDF: %s (%.2fs)", out_path, elapsed)
+
+            # Best-effort cleanup
             try:
                 drive.files().delete(fileId=file_id).execute()
-                logging.debug("Deleted temp file id=%s", file_id)
-            except Exception as de:
-                logging.warning("Could not delete temp file id=%s: %s", file_id, de)
+            except Exception:
+                pass
+            return "success"
+
+        except HttpError as he:
+            status = getattr(he, "status_code", None) or getattr(
+                getattr(he, "resp", None), "status", None
+            )
+            if status == 400 and attempt == attempts:
+                logging.error(
+                    "Permanent HTTP 400 on %s after %d attempts: %s",
+                    filename,
+                    attempt,
+                    he,
+                )
+                return "failed"
+            logging.warning(
+                "HTTP error on %s attempt %d/%d: %s", filename, attempt, attempts, he
+            )
+        except (BrokenPipeError, OSError) as ioe:
+            if attempt == attempts:
+                logging.error(
+                    "I/O error on %s after %d attempts: %s", filename, attempt, ioe
+                )
+                return "failed"
+            logging.warning(
+                "I/O error on %s attempt %d/%d: %s", filename, attempt, attempts, ioe
+            )
+        except Exception as e:
+            if attempt == attempts:
+                logging.error(
+                    "Unexpected error on %s after %d attempts: %s",
+                    filename,
+                    attempt,
+                    e,
+                    exc_info=True,
+                )
+                return "failed"
+            logging.warning(
+                "Retryable error on %s attempt %d/%d: %s",
+                filename,
+                attempt,
+                attempts,
+                e,
+            )
+        finally:
+            if file_id:
+                # Attempt cleanup between retries
+                try:
+                    thread_drive().files().delete(fileId=file_id).execute()
+                except Exception:
+                    pass
+
+        # Exponential backoff with jitter
+        time.sleep(backoff + uniform(0, 0.2))
+        backoff *= 2
+
+    return "failed"
 
 
-def process_all(drive):
-    # Collect supported files
+def process_all(creds):
     entries = [os.path.join(INPUT_DIR, n) for n in sorted(os.listdir(INPUT_DIR))]
     files = [
         p
@@ -238,16 +338,25 @@ def process_all(drive):
         return
     start_batch = time.time()
     logging.info("Starting batch: %d files with %d workers", len(files), MAX_WORKERS)
+    results = {"success": 0, "failed": 0, "skipped": 0}
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(convert_one, drive, f): f for f in files}
+        futures = {executor.submit(convert_one, creds, f): f for f in files}
         for fut in concurrent.futures.as_completed(futures):
             f = futures[fut]
             try:
-                fut.result()
+                status = fut.result()
+                if status in results:
+                    results[status] += 1
             except Exception as e:
                 logging.error("Failed converting %s: %s", f, e)
+                results["failed"] += 1
+    elapsed = time.time() - start_batch
     logging.info(
-        "Batch complete: %d files in %.2fs", len(files), time.time() - start_batch
+        "Batch complete in %.2fs | success=%d skipped=%d failed=%d",
+        elapsed,
+        results["success"],
+        results["skipped"],
+        results["failed"],
     )
 
 
@@ -261,9 +370,8 @@ def main():
         ensure_directories()
         validate_embedded_credentials()
         creds = load_or_authorize()
-        drive = build_drive(creds)
         logging.info("Using up to %d concurrent workers", MAX_WORKERS)
-        process_all(drive)
+        process_all(creds)
         logging.info("Done.")
         logging.info("Place additional files in '%s' and run again.", INPUT_DIR)
     except SystemExit as se:
