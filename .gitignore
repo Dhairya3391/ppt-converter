@@ -1,1 +1,7 @@
-service-account.json
+token.json
+input/
+output/
+*.log
+*.tmp
+.DS_Store
+.env
