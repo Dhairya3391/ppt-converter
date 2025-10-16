@@ -34,8 +34,6 @@ import json
 import time
 import logging
 from typing import Optional
-import concurrent.futures
-import threading
 from random import uniform
 
 # Load environment variables from .env file
@@ -69,11 +67,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 INPUT_DIR = os.path.join(BASE_DIR, "input")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 TOKEN_PATH = os.path.join(BASE_DIR, "token.json")
-# Max parallel conversions (bounded to avoid too many simultaneous HTTP requests)
-MAX_WORKERS = min(4, (os.cpu_count() or 4))
-# Thread-local storage for per-thread Drive service
-_thread_local = None  # will initialize lazily after importing threading
-
 SUPPORTED_MIME = {
     ".doc": ("application/msword", "application/vnd.google-apps.document"),
     ".docx": (
@@ -94,6 +87,23 @@ SUPPORTED_MIME = {
         "application/vnd.google-apps.spreadsheet",
     ),
 }
+
+RESUMABLE_THRESHOLD_BYTES = 5 * 1024 * 1024
+RESUMABLE_UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024  # multiple of 256 KB per API requirement
+
+
+def _format_size(num_bytes: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(num_bytes)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
 
 
 def ensure_directories():
@@ -195,15 +205,11 @@ def build_drive(creds: Credentials):
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def convert_one(creds, path: str):
+def convert_one(drive, path: str, file_size: Optional[int] = None):
     """
     Convert a single file with retries.
     Returns: 'success' | 'failed' | 'skipped'
     """
-    global _thread_local
-    if _thread_local is None:
-        _thread_local = threading.local()
-
     ext = os.path.splitext(path)[1].lower()
     mapping = SUPPORTED_MIME.get(ext)
     if not mapping:
@@ -223,13 +229,14 @@ def convert_one(creds, path: str):
         except OSError:
             pass
 
-    def thread_drive():
-        if not hasattr(_thread_local, "drive"):
-            _thread_local.drive = build_drive(creds)
-        return _thread_local.drive
-
-    size = os.path.getsize(path)
-    resumable = size > 5 * 1024 * 1024  # Use resumable uploads for files >5MB
+    size = file_size if file_size is not None else os.path.getsize(path)
+    resumable = size > RESUMABLE_THRESHOLD_BYTES
+    logging.info(
+        "Converting %s (%s) -> %s",
+        filename,
+        _format_size(size),
+        pdf_name,
+    )
 
     attempts = 3
     backoff = 1.0
@@ -238,9 +245,14 @@ def convert_one(creds, path: str):
         file_id = None
         try:
             src_mime, tgt_mime = mapping
-            media = MediaFileUpload(path, mimetype=src_mime, resumable=resumable)
+            upload_kwargs = {
+                "mimetype": src_mime,
+                "resumable": resumable,
+            }
+            if resumable:
+                upload_kwargs["chunksize"] = RESUMABLE_UPLOAD_CHUNK_SIZE
+            media = MediaFileUpload(path, **upload_kwargs)
             metadata = {"name": filename, "mimeType": tgt_mime}
-            drive = thread_drive()
             created = (
                 drive.files()
                 .create(body=metadata, media_body=media, fields="id")
@@ -258,7 +270,7 @@ def convert_one(creds, path: str):
                 fileId=file_id, mimeType="application/pdf"
             )
             with open(out_path, "wb") as f:
-                f.write(request.execute())
+                f.write(request.execute(num_retries=2))
 
             elapsed = time.time() - start
             logging.info("Saved PDF: %s (%.2fs)", out_path, elapsed)
@@ -315,7 +327,7 @@ def convert_one(creds, path: str):
             if file_id:
                 # Attempt cleanup between retries
                 try:
-                    thread_drive().files().delete(fileId=file_id).execute()
+                    drive.files().delete(fileId=file_id).execute()
                 except Exception:
                     pass
 
@@ -326,30 +338,41 @@ def convert_one(creds, path: str):
     return "failed"
 
 
-def process_all(creds):
-    entries = [os.path.join(INPUT_DIR, n) for n in sorted(os.listdir(INPUT_DIR))]
-    files = [
-        p
-        for p in entries
-        if os.path.isfile(p) and os.path.splitext(p)[1].lower() in SUPPORTED_MIME
-    ]
-    if not files:
+def process_all(drive):
+    entries = [os.path.join(INPUT_DIR, n) for n in os.listdir(INPUT_DIR)]
+    file_info = []
+    for path in entries:
+        ext = os.path.splitext(path)[1].lower()
+        if not os.path.isfile(path) or ext not in SUPPORTED_MIME:
+            continue
+        try:
+            size = os.path.getsize(path)
+        except OSError as e:
+            logging.warning("Skipping %s (stat failed: %s)", path, e)
+            continue
+        file_info.append((path, size))
+
+    if not file_info:
         logging.warning("Input directory is empty or no supported files: %s", INPUT_DIR)
         return
+
+    file_info.sort(key=lambda item: os.path.basename(item[0]).lower())
+    total = len(file_info)
+    logging.info("Starting batch: %d files (sequential)", total)
     start_batch = time.time()
-    logging.info("Starting batch: %d files with %d workers", len(files), MAX_WORKERS)
     results = {"success": 0, "failed": 0, "skipped": 0}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(convert_one, creds, f): f for f in files}
-        for fut in concurrent.futures.as_completed(futures):
-            f = futures[fut]
-            try:
-                status = fut.result()
-                if status in results:
-                    results[status] += 1
-            except Exception as e:
-                logging.error("Failed converting %s: %s", f, e)
-                results["failed"] += 1
+    for index, (path, size) in enumerate(file_info, start=1):
+        filename = os.path.basename(path)
+        loader_msg = f"[{index}/{total}] Converting {filename}..."
+        print(loader_msg, end="", flush=True)
+        try:
+            status = convert_one(drive, path, size)
+        except Exception as e:
+            logging.error("Failed converting %s: %s", path, e)
+            status = "failed"
+        if status in results:
+            results[status] += 1
+        print(f" {status.upper()}")
     elapsed = time.time() - start_batch
     logging.info(
         "Batch complete in %.2fs | success=%d skipped=%d failed=%d",
@@ -370,8 +393,8 @@ def main():
         ensure_directories()
         validate_embedded_credentials()
         creds = load_or_authorize()
-        logging.info("Using up to %d concurrent workers", MAX_WORKERS)
-        process_all(creds)
+        drive = build_drive(creds)
+        process_all(drive)
         logging.info("Done.")
         logging.info("Place additional files in '%s' and run again.", INPUT_DIR)
     except SystemExit as se:

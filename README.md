@@ -37,3 +37,4 @@ python ToPdf.py --input input_files --output output_pdfs --service-account servi
 
 - Files are uploaded to Google Drive, converted, exported as PDF, and deleted from Drive automatically.
 - Make sure your service account has access to the Drive API.
+- Files are converted one at a time; the terminal shows a simple "Converting <file>..." line for each document so you know which one is in progress.
